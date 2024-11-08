@@ -1,14 +1,17 @@
+import copy
 import math
+import numpy as np
+import scipy
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.nn import Conv1d
+
+from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm
-from collections import OrderedDict
+
 import commons
 from commons import init_weights, get_padding
-from .transforms import piecewise_rational_quadratic_transform
-
+from transforms import piecewise_rational_quadratic_transform
 
 LRELU_SLOPE = 0.1
 
@@ -386,140 +389,3 @@ class ConvFlow(nn.Module):
 			return x, logdet
 		else:
 			return x
-
-
-class Conv(nn.Module):
-	"""
-	Convolution Module
-	"""
-	
-	def __init__(
-			self,
-			in_channels,
-			out_channels,
-			kernel_size=1,
-			stride=1,
-			padding=0,
-			dilation=1,
-			bias=True,
-			w_init="linear",
-	):
-		"""
-		:param in_channels: dimension of input
-		:param out_channels: dimension of output
-		:param kernel_size: size of kernel
-		:param stride: size of stride
-		:param padding: size of padding
-		:param dilation: dilation rate
-		:param bias: boolean. if True, bias is included.
-		:param w_init: str. weight inits with xavier initialization.
-		"""
-		super(Conv, self).__init__()
-		
-		self.conv = nn.Conv1d(
-			in_channels,
-			out_channels,
-			kernel_size=kernel_size,
-			stride=stride,
-			padding=padding,
-			dilation=dilation,
-			bias=bias,
-		)
-	
-	def forward(self, x):
-		x = x.contiguous().transpose(1, 2)
-		x = self.conv(x)
-		x = x.contiguous().transpose(1, 2)
-		
-		return x
-
-
-class StylePredictor(nn.Module):
-	"""Duration, Pitch and Energy Predictor"""
-	
-	def __init__(self, hidden_channels, filter_size, kernel_size, p_dropout):
-		super(StylePredictor, self).__init__()
-		
-		self.input_size = hidden_channels
-		self.filter_size = filter_size
-		self.kernel = kernel_size
-		self.conv_output_size = filter_size
-		self.dropout = p_dropout
-		
-		self.conv_layer = nn.Sequential(
-			OrderedDict(
-				[
-					(
-						"conv1d_1",
-						Conv(
-							self.input_size,
-							self.filter_size,
-							kernel_size=self.kernel,
-							padding=(self.kernel - 1) // 2,
-						),
-					),
-					("relu_1", nn.ReLU()),
-					("layer_norm_1", nn.LayerNorm(self.filter_size)),
-					("dropout_1", nn.Dropout(self.dropout)),
-					(
-						"conv1d_2",
-						Conv(
-							self.filter_size,
-							self.filter_size,
-							kernel_size=self.kernel,
-							padding=1,
-						),
-					),
-					("relu_2", nn.ReLU()),
-					("layer_norm_2", nn.LayerNorm(self.filter_size)),
-					("dropout_2", nn.Dropout(self.dropout)),
-				]
-			)
-		)
-		
-		self.linear_layer = nn.Linear(self.conv_output_size, 2 * self.input_size)
-	
-	def forward(self, x, y, mask):
-		out = y + x
-		out = self.conv_layer(out)
-		out = self.linear_layer(out)
-		out, hidden = torch.split(out, self.input_size, 2)
-		
-		if mask is not None:
-			out = out * mask
-		
-		return out, hidden
-
-	
-class ConvNorm(torch.nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=1,
-        stride=1,
-        padding=None,
-        dilation=1,
-        bias=True,
-        w_init_gain="linear",
-    ):
-        super(ConvNorm, self).__init__()
-
-        if padding is None:
-            assert kernel_size % 2 == 1
-            padding = int(dilation * (kernel_size - 1) / 2)
-
-        self.conv = torch.nn.Conv1d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            bias=bias,
-        )
-
-    def forward(self, signal):
-        conv_signal = self.conv(signal)
-
-        return conv_signal
