@@ -3,12 +3,11 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-
+from collections import OrderedDict
 import commons
 import modules
 import attentions
 import monotonic_align
-
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
 from commons import init_weights, get_padding
@@ -446,6 +445,14 @@ class SynthesizerTrn(nn.Module):
 		                         n_layers,
 		                         kernel_size,
 		                         p_dropout)
+		self.enc_style = StyleEncoder(n_vocab,
+		                         inter_channels,
+		                         hidden_channels,
+		                         filter_channels,
+		                         n_heads,
+		                         n_layers,
+		                         kernel_size,
+		                         p_dropout)
 		self.dec = Generator(inter_channels, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates,
 		                     upsample_initial_channel, upsample_kernel_sizes, gin_channels=gin_channels)
 		self.enc_q = PosteriorEncoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16,
@@ -460,9 +467,9 @@ class SynthesizerTrn(nn.Module):
 		if n_speakers > 1:
 			self.emb_g = nn.Embedding(n_speakers, gin_channels)
 	
-	def forward(self, x, x_lengths, y, y_lengths, sid=None):
-		
-		x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+	def forward(self, text, text_lengths, y, y_lengths, sid=None):
+		x = self.enc_style(text, text_lengths)
+		text, m_p, logs_p, text_mask = self.enc_p(text, text_lengths)
 		if self.n_speakers > 0:
 			g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
 		else:
@@ -475,56 +482,57 @@ class SynthesizerTrn(nn.Module):
 			# negative cross-entropy
 			s_p_sq_r = torch.exp(-2 * logs_p)  # [b, d, t]
 			neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True)  # [b, 1, t_s]
-			neg_cent2 = torch.matmul(-0.5 * (z_p ** 2).transpose(1, 2),
-			                         s_p_sq_r)  # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
+			neg_cent2 = torch.matmul(-0.5 * (z_p ** 2).transpose(1, 2), s_p_sq_r)  # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
 			neg_cent3 = torch.matmul(z_p.transpose(1, 2), (m_p * s_p_sq_r))  # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
 			neg_cent4 = torch.sum(-0.5 * (m_p ** 2) * s_p_sq_r, [1], keepdim=True)  # [b, 1, t_s]
 			neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
 			
-			attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+			attn_mask = torch.unsqueeze(text_mask, 2) * torch.unsqueeze(y_mask, -1)
 			attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
 		
 		w = attn.sum(2)
 		if self.use_sdp:
-			l_length = self.dp(x, x_mask, w, g=g)
-			l_length = l_length / torch.sum(x_mask)
+			l_length = self.dp(text, text_mask, w, g=g)
+			l_length = l_length / torch.sum(text_mask)
 		else:
-			logw_ = torch.log(w + 1e-6) * x_mask
-			logw = self.dp(x, x_mask, g=g)
-			l_length = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(x_mask)  # for averaging
+			logw_ = torch.log(w + 1e-6) * text_mask
+			logw = self.dp(text, text_mask, g=g)
+			l_length = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(text_mask)  # for averaging
 		
 		# expand prior
 		m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
 		logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
-		
+		x = torch.matmul(attn.squeeze(1), x.transpose(1, 2)).transpose(1, 2)
+		z = x + z
 		z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
 		o = self.dec(z_slice, g=g)
-		return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+		return o, l_length, attn, ids_slice, text_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
 	
-	def infer(self, x, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
-		x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+	def infer(self, text, text_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
+		x = self.enc_style(text, text_lengths)
+		text, m_p, logs_p, text_mask = self.enc_p(text, text_lengths)
 		if self.n_speakers > 0:
 			g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
 		else:
 			g = None
 		
 		if self.use_sdp:
-			logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
+			logw = self.dp(text, text_mask, g=g, reverse=True, noise_scale=noise_scale_w)
 		else:
-			logw = self.dp(x, x_mask, g=g)
-		w = torch.exp(logw) * x_mask * length_scale
+			logw = self.dp(text, text_mask, g=g)
+		w = torch.exp(logw) * text_mask * length_scale
 		w_ceil = torch.ceil(w)
 		y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
-		y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(x_mask.dtype)
-		attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+		y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(text_mask.dtype)
+		attn_mask = torch.unsqueeze(text_mask, 2) * torch.unsqueeze(y_mask, -1)
 		attn = commons.generate_path(w_ceil, attn_mask)
 		
 		m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)  # [b, t', t], [b, t, d] -> [b, d, t']
-		logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1,
-		                                                                         2)  # [b, t', t], [b, t, d] -> [b, d, t']
+		logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)  # [b, t', t], [b, t, d] -> [b, d, t']
 		
 		z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
 		z = self.flow(z_p, y_mask, g=g, reverse=True)
+		z = z + x
 		o = self.dec((z * y_mask)[:, :, :max_len], g=g)
 		return o, attn, y_mask, (z, z_p, m_p, logs_p)
 	
@@ -537,3 +545,184 @@ class SynthesizerTrn(nn.Module):
 		z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
 		o_hat = self.dec(z_hat * y_mask, g=g_tgt)
 		return o_hat, y_mask, (z, z_p, z_hat)
+
+
+class StyleEncoder(nn.Module):
+	def __init__(self, n_vocab, out_channels, hidden_channels, filter_channels, n_heads, n_layers, kernel_size,
+	             p_dropout):
+		super().__init__()
+		self.n_vocab = n_vocab
+		self.out_channels = out_channels
+		self.hidden_channels = hidden_channels
+		self.filter_channels = filter_channels
+		self.n_heads = n_heads
+		self.n_layers = n_layers
+		self.kernel_size = kernel_size
+		self.p_dropout = p_dropout
+		
+		self.emb = nn.Embedding(n_vocab, hidden_channels)
+		nn.init.normal_(self.emb.weight, 0.0, hidden_channels ** -0.5)
+		
+		self.encoder = attentions.Encoder(
+			hidden_channels,
+			filter_channels,
+			n_heads,
+			n_layers,
+			kernel_size,
+			p_dropout)
+		self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+	
+	def forward(self, x, x_lengths):
+		x = self.emb(x) * math.sqrt(self.hidden_channels)  # [b, t, h]
+		x = torch.transpose(x, 1, -1)  # [b, h, t]
+		x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+		
+		x = self.encoder(x * x_mask, x_mask)
+
+		return x
+
+
+class StyleAdaptor(nn.Module):
+    """Variance Adaptor"""
+
+    def __init__(self, layer_number, hidden_channels, filter_size, kernel_size, dropout):
+        super(StyleAdaptor, self).__init__()
+        self.layer_number = layer_number
+        # self.duration_predictor = VariancePredictor(hidden_channels, filter_size, kernel_size, dropout)
+        self.encoder = nn.ModuleList(
+            [
+                StylePredictor(hidden_channels, filter_size, kernel_size, dropout)
+                for _ in range(layer_number)
+            ]
+        )
+        self.decoder = nn.ModuleList(
+            [
+                StylePredictor(hidden_channels, filter_size, kernel_size, dropout)
+                for _ in range(layer_number)
+            ]
+        )
+        self.proj = nn.Conv1d(hidden_channels, hidden_channels * layer_number, 1)
+
+
+    def forward(
+        self,
+        x,
+        style_features,
+        src_mask
+    ):
+        src_mask = torch.transpose(src_mask, 1, 2)
+        style_features = self.proj(style_features)
+        style_features = torch.transpose(style_features, 1, -1)
+        out = x
+        y = torch.split(style_features, x.size(2), 2)
+        hidden_list = []
+        for i, encoder in enumerate(self.encoder):
+            out, hidden = encoder(out, y[i], src_mask)
+            hidden_list.append(hidden)
+        out = x
+        for i, decoder in enumerate(self.decoder):
+            out, _ = decoder(out, hidden_list[-i-1], src_mask)
+        return out
+
+
+class StylePredictor(nn.Module):
+	"""Duration, Pitch and Energy Predictor"""
+	
+	def __init__(self, hidden_channels, filter_size, kernel_size, p_dropout):
+		super(StylePredictor, self).__init__()
+		
+		self.input_size = hidden_channels
+		self.filter_size = filter_size
+		self.kernel = kernel_size
+		self.conv_output_size = filter_size
+		self.dropout = p_dropout
+		
+		self.conv_layer = nn.Sequential(
+			OrderedDict(
+				[
+					(
+						"conv1d_1",
+						Conv(
+							self.input_size,
+							self.filter_size,
+							kernel_size=self.kernel,
+							padding=(self.kernel - 1) // 2,
+						),
+					),
+					("relu_1", nn.ReLU()),
+					("layer_norm_1", nn.LayerNorm(self.filter_size)),
+					("dropout_1", nn.Dropout(self.dropout)),
+					(
+						"conv1d_2",
+						Conv(
+							self.filter_size,
+							self.filter_size,
+							kernel_size=self.kernel,
+							padding=1,
+						),
+					),
+					("relu_2", nn.ReLU()),
+					("layer_norm_2", nn.LayerNorm(self.filter_size)),
+					("dropout_2", nn.Dropout(self.dropout)),
+				]
+			)
+		)
+		
+		self.linear_layer = nn.Linear(self.conv_output_size, 2 * self.input_size)
+	
+	def forward(self, x, y, mask):
+		out = y + x
+		out = self.conv_layer(out)
+		out = self.linear_layer(out)
+		out, hidden = torch.split(out, self.input_size, 2)
+		
+		if mask is not None:
+			out = out * mask
+		
+		return out, hidden
+
+
+class Conv(nn.Module):
+	"""
+	Convolution Module
+	"""
+	
+	def __init__(
+			self,
+			in_channels,
+			out_channels,
+			kernel_size=1,
+			stride=1,
+			padding=0,
+			dilation=1,
+			bias=True,
+			w_init="linear",
+	):
+		"""
+		:param in_channels: dimension of input
+		:param out_channels: dimension of output
+		:param kernel_size: size of kernel
+		:param stride: size of stride
+		:param padding: size of padding
+		:param dilation: dilation rate
+		:param bias: boolean. if True, bias is included.
+		:param w_init: str. weight inits with xavier initialization.
+		"""
+		super(Conv, self).__init__()
+		
+		self.conv = nn.Conv1d(
+			in_channels,
+			out_channels,
+			kernel_size=kernel_size,
+			stride=stride,
+			padding=padding,
+			dilation=dilation,
+			bias=bias,
+		)
+	
+	def forward(self, x):
+		x = x.contiguous().transpose(1, 2)
+		x = self.conv(x)
+		x = x.contiguous().transpose(1, 2)
+		
+		return x
