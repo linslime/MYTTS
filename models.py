@@ -436,7 +436,7 @@ class SynthesizerTrn(nn.Module):
 		self.gin_channels = gin_channels
 		
 		self.use_sdp = use_sdp
-		
+		self.style_adaptor = StyleAdaptor(6, hidden_channels, 256, kernel_size, p_dropout)
 		self.enc_p = TextEncoder(n_vocab,
 		                         inter_channels,
 		                         hidden_channels,
@@ -503,7 +503,7 @@ class SynthesizerTrn(nn.Module):
 		m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
 		logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
 		x = torch.matmul(attn.squeeze(1), x.transpose(1, 2)).transpose(1, 2)
-		z = x + z
+		z = self.style_adaptor(x, z, y_mask)
 		z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
 		o = self.dec(z_slice, g=g)
 		return o, l_length, attn, ids_slice, text_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
@@ -529,7 +529,7 @@ class SynthesizerTrn(nn.Module):
 		
 		m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)  # [b, t', t], [b, t, d] -> [b, d, t']
 		logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)  # [b, t', t], [b, t, d] -> [b, d, t']
-		
+		x = torch.matmul(attn.squeeze(1), x.transpose(1, 2)).transpose(1, 2)
 		z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
 		z = self.flow(z_p, y_mask, g=g, reverse=True)
 		z = z + x
@@ -578,7 +578,9 @@ class StyleEncoder(nn.Module):
 		x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
 		
 		x = self.encoder(x * x_mask, x_mask)
-
+		stats = self.proj(x) * x_mask
+		m, logs = torch.split(stats, self.out_channels, dim=1)
+		x = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
 		return x
 
 
@@ -588,7 +590,6 @@ class StyleAdaptor(nn.Module):
     def __init__(self, layer_number, hidden_channels, filter_size, kernel_size, dropout):
         super(StyleAdaptor, self).__init__()
         self.layer_number = layer_number
-        # self.duration_predictor = VariancePredictor(hidden_channels, filter_size, kernel_size, dropout)
         self.encoder = nn.ModuleList(
             [
                 StylePredictor(hidden_channels, filter_size, kernel_size, dropout)
@@ -610,6 +611,7 @@ class StyleAdaptor(nn.Module):
         style_features,
         src_mask
     ):
+        x = x.transpose(1, -1)
         src_mask = torch.transpose(src_mask, 1, 2)
         style_features = self.proj(style_features)
         style_features = torch.transpose(style_features, 1, -1)
@@ -622,7 +624,7 @@ class StyleAdaptor(nn.Module):
         out = x
         for i, decoder in enumerate(self.decoder):
             out, _ = decoder(out, hidden_list[-i-1], src_mask)
-        return out
+        return out.transpose(1, -1)
 
 
 class StylePredictor(nn.Module):
