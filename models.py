@@ -532,7 +532,7 @@ class SynthesizerTrn(nn.Module):
 		x = torch.matmul(attn.squeeze(1), x.transpose(1, 2)).transpose(1, 2)
 		z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
 		z = self.flow(z_p, y_mask, g=g, reverse=True)
-		z = z + x
+		z = self.style_adaptor(x, z, y_mask)
 		o = self.dec((z * y_mask)[:, :, :max_len], g=g)
 		return o, attn, y_mask, (z, z_p, m_p, logs_p)
 	
